@@ -1,0 +1,6 @@
+# main.py 运行依赖：
+#   Python 3.9+ 标准库（含 tkinter / Tcl-Tk）
+#   tkinter 随官方 Python 安装包提供，不能通过 pip 安装，故不在此列出。
+#
+# 打包 exe 的构建依赖：
+pyinstaller>=6.0
