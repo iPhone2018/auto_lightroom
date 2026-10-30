@@ -5,6 +5,7 @@
 
 启动：
     source ../auto_vimeo/venv/bin/activate
+    pip install openpyxl
     python main.py
 """
 from __future__ import annotations
@@ -692,6 +693,13 @@ from tkinter import filedialog, messagebox, ttk
 import tkinter as tk
 from tkinter.scrolledtext import ScrolledText
 
+try:
+    from openpyxl import Workbook
+    from openpyxl.styles import Font
+except ImportError:  # Excel 统计需要 openpyxl
+    Workbook = None
+    Font = None
+
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".lightroom_auto_gui")
@@ -707,11 +715,13 @@ IMAGE_EXTS = {
 
 RESULTS_FILENAME = "results.csv"
 LOG_FILENAME = "run.log"
-SHARE_LINKS_FILENAME = "结果链接.txt"
+STATS_FILENAME = "结果统计.xlsx"
 RESULT_HEADERS = [
     "时间", "账号", "账号标识", "图片文件", "标题",
     "asset_id", "album_id", "space_id", "共享链接",
 ]
+STATS_HEADERS = ["CK", "成功数", "失败数", "总数"]
+STATS_FLUSH_INTERVAL = 20
 
 
 # ---------------------------------------------------------------------------
@@ -790,21 +800,23 @@ def find_duplicate_asset(
     return None
 
 
-def read_title_file(path: str) -> list[str]:
+def decode_text_file(path: str) -> str | None:
     with open(path, "rb") as fh:
         raw = fh.read()
-    text: str | None = None
     if raw.startswith(b"\xef\xbb\xbf"):
-        text = raw.decode("utf-8-sig", "replace")
-    elif raw.startswith((b"\xff\xfe", b"\xfe\xff")):
-        text = raw.decode("utf-16", "replace")
-    else:
-        for encoding in ("utf-8", "gb18030", "latin-1"):
-            try:
-                text = raw.decode(encoding)
-                break
-            except UnicodeDecodeError:
-                continue
+        return raw.decode("utf-8-sig", "replace")
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return raw.decode("utf-16", "replace")
+    for encoding in ("utf-8", "gb18030", "latin-1"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return None
+
+
+def read_title_file(path: str) -> list[str]:
+    text = decode_text_file(path)
     if text is None:
         return []
     titles: list[str] = []
@@ -951,6 +963,18 @@ def parse_cookie_entries(text: str) -> list[dict]:
     return entries
 
 
+def read_cookie_entries_from_file(path: str) -> list[dict]:
+    """Read a txt file and return one CK entry per non-empty line."""
+    text = decode_text_file(path)
+    if text is None:
+        return []
+    return [
+        entry
+        for entry in parse_cookie_entries(text)
+        if "=" in entry["header"]
+    ]
+
+
 def ensure_config_dir() -> None:
     os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
     try:
@@ -998,13 +1022,6 @@ def append_result_csv(output_dir: str, row: list) -> None:
         writer.writerow(row)
 
 
-def append_share_link(output_dir: str, url: str) -> None:
-    os.makedirs(output_dir, exist_ok=True)
-    path = os.path.join(output_dir, SHARE_LINKS_FILENAME)
-    with open(path, "a", encoding="utf-8") as fh:
-        fh.write(url.rstrip() + "\n")
-
-
 # ---------------------------------------------------------------------------
 # title pool
 # ---------------------------------------------------------------------------
@@ -1026,6 +1043,65 @@ class TitlePool:
 
     def random_title(self) -> str:
         return "".join(random.choice(part) for part in self.parts)
+
+
+def excel_safe(value: str) -> str:
+    """Strip characters / lengths Excel refuses to store in a cell."""
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", str(value))
+    return text[:32767]
+
+
+class ExcelStatsWriter:
+    """Per-CK success/failure counters stored in a single .xlsx file."""
+
+    def __init__(self, path: str, accounts: list["Account"]):
+        if Workbook is None:
+            raise RuntimeError(
+                "缺少 openpyxl，无法写入 Excel。请先执行: pip install openpyxl"
+            )
+        self.path = path
+        self.workbook = Workbook()
+        sheet = self.workbook.active
+        sheet.title = "统计"
+        sheet.append(STATS_HEADERS)
+        if Font is not None:
+            for cell in sheet[1]:
+                cell.font = Font(bold=True)
+        sheet.column_dimensions["A"].width = 90
+        sheet.column_dimensions["B"].width = 10
+        sheet.column_dimensions["C"].width = 10
+        sheet.column_dimensions["D"].width = 10
+        sheet.freeze_panes = "A2"
+        self.sheet = sheet
+        self.rows: dict[int, int] = {}
+        for account in accounts:
+            self.add_account(account)
+        self.save()
+
+    def add_account(self, account: "Account") -> None:
+        row = self.sheet.max_row + 1
+        self.sheet.cell(row=row, column=1, value=excel_safe(account.header))
+        for column in (2, 3, 4):
+            self.sheet.cell(row=row, column=column, value=0)
+        self.rows[account.index] = row
+
+    def update(
+        self, account: "Account", success: int, failed: int, total: int
+    ) -> None:
+        row = self.rows.get(account.index)
+        if row is None:
+            self.add_account(account)
+            row = self.rows[account.index]
+        self.sheet.cell(row=row, column=2, value=success)
+        self.sheet.cell(row=row, column=3, value=failed)
+        self.sheet.cell(row=row, column=4, value=total)
+        self.save()
+
+    def save(self) -> None:
+        directory = os.path.dirname(self.path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        self.workbook.save(self.path)
 
 
 # ---------------------------------------------------------------------------
@@ -1055,16 +1131,20 @@ class LogStream(io.TextIOBase):
 
 
 class Account:
-    def __init__(self, entry: dict):
+    def __init__(self, index: int, entry: dict):
+        self.index = index
         self.header = entry["header"]
         self.key = entry["identity"]
-        self.label = "账号"
+        self.label = f"CK{index + 1}"
         self.client = lr.LightroomClient(cookie_header=self.header)
         self.catalog_id: str | None = None
         self.account_id: str | None = None
         self.storage: dict | None = None
         self.storage_at = 0.0
         self.healthy = True
+        self.exhausted = False
+        self.stats = {"success": 0, "failed": 0, "total": 0}
+        self.flushed_total = 0
 
     def describe(self) -> str:
         return f"{self.label} [{self.key}]"
@@ -1078,8 +1158,8 @@ class Worker(threading.Thread):
         self.stop_event = stop_event
         self.output_dir = config["output_dir"]
         self.pool: TitlePool | None = None
-        self.account: Account | None = None
-        self.quota_stop = False
+        self.accounts: list[Account] = []
+        self.stats_writer: ExcelStatsWriter | None = None
 
     # -- logging --------------------------------------------------------
     def log(self, message: str) -> None:
@@ -1102,10 +1182,15 @@ class Worker(threading.Thread):
         }
         try:
             images = scan_images(self.config["image_dir"])
-            stats["total"] = len(images)
+            entries = self.config["cookie_entries"]
+            self.accounts = [
+                Account(index, entry) for index, entry in enumerate(entries)
+            ]
+            total_tasks = len(images) * len(self.accounts)
+            stats["total"] = total_tasks
             self.log(
-                f"图片 {len(images)} 张，标题文件 {len(self.config['title_files'])} 个，"
-                f"账号 1 个"
+                f"图片 {len(images)} 张，标题文件 "
+                f"{len(self.config['title_files'])} 个，CK {len(self.accounts)} 个"
             )
             if not images:
                 self.log("图片目录里没有可识别的图片，结束")
@@ -1115,62 +1200,111 @@ class Worker(threading.Thread):
             except ValueError as exc:
                 self.log(f"标题文件错误: {exc}")
                 return
-            self.log(f"标题组合总数: {self.pool.total}")
+            self.log(
+                f"标题组合总数: {self.pool.total}（图片 {len(images)} 张 × "
+                f"CK {len(self.accounts)} 个 = 约 {total_tasks} 个标题）"
+            )
+            if self.pool.total < total_tasks:
+                self.log(
+                    f"提示：标题组合数 {self.pool.total} 少于本轮标题生成"
+                    f"次数 {total_tasks}，部分标题会重复使用（不影响上传）"
+                )
+            if self.config["delete_images"] and len(self.accounts) > 1:
+                self.log(
+                    "提示：已勾选删除源图片，只会在最后一个 CK 成功处理"
+                    "每张图片后删除，前面的 CK 不会删除"
+                )
 
-            self.setup_account()
-            if not self.account or not self.account.healthy:
-                self.log("账号不可用，结束")
-                return
+            self.open_stats_writer()
 
-            for index, image_path in enumerate(images):
-                if self.quota_stop:
-                    self.log("配额不足，已停止全部流程")
-                    break
+            done_tasks = 0
+            for acct in self.accounts:
                 if self.stop_event.is_set():
                     self.log("收到停止信号，结束")
                     break
-                if not self.account or not self.account.healthy:
-                    self.log("账号不可用，停止运行")
-                    break
-                filename = os.path.basename(image_path)
-                relpath = os.path.relpath(image_path, self.config["image_dir"])
-                try:
-                    size = os.path.getsize(image_path)
-                except OSError as exc:
-                    self.log(f"读取文件失败 {relpath}: {exc}")
-                    stats["failed"] += 1
+                self.setup_account(acct)
+                if not acct.healthy:
+                    self.flush_account(acct)
+                    self.log(f"{acct.label} 不可用，跳过该 CK")
                     continue
-                outcome, deleted = self.process_image(
-                    index, image_path, relpath, filename, size
+                self.log(f"开始使用 {acct.describe()}")
+
+                for image_index, image_path in enumerate(images):
+                    if self.stop_event.is_set():
+                        self.log("收到停止信号，结束")
+                        break
+                    if acct.exhausted or not acct.healthy:
+                        break
+                    filename = os.path.basename(image_path)
+                    relpath = os.path.relpath(
+                        image_path, self.config["image_dir"]
+                    )
+                    try:
+                        size = os.path.getsize(image_path)
+                    except OSError as exc:
+                        self.log(f"读取文件失败 {relpath}: {exc}")
+                        stats["failed"] += 1
+                        done_tasks += 1
+                        continue
+                    outcome, deleted = self.process_image(
+                        acct, image_index, image_path, relpath, filename, size
+                    )
+                    if outcome == "switch":
+                        break
+                    self.record_outcome(acct, outcome)
+                    stats[outcome] += 1
+                    done_tasks += 1
+                    if deleted:
+                        stats["deleted"] += 1
+                    progress = (
+                        f"进度 {done_tasks}/{total_tasks} | "
+                        f"CK {acct.index + 1}/{len(self.accounts)} | "
+                        f"图片 {image_index + 1}/{len(images)} | "
+                        f"成功 {stats['success']} | 重复 {stats['duplicate']} | "
+                        f"失败 {stats['failed']}"
+                    )
+                    self.ui_queue.put(("progress", progress))
+                    time.sleep(0.4)
+
+                self.flush_account(acct)
+                st = acct.stats
+                self.log(
+                    f"{acct.label} 结束：成功 {st['success']}，"
+                    f"失败 {st['failed']}，总数 {st['total']}"
                 )
-                if outcome == "quota_stop":
-                    self.log("配额不足，已停止全部流程")
+                if self.stop_event.is_set():
                     break
-                stats[outcome] += 1
-                if deleted:
-                    stats["deleted"] += 1
-                progress = (
-                    f"进度 {index + 1}/{len(images)} | 成功 {stats['success']} | "
-                    f"重复 {stats['duplicate']} | 失败 {stats['failed']} | "
-                    f"跳过 {stats['skipped']} | 删除 {stats['deleted']}"
-                )
-                self.ui_queue.put(("progress", progress))
-                time.sleep(0.4)
+
             self.log(
                 f"结束：成功 {stats['success']}，重复跳过 {stats['duplicate']}，"
                 f"失败 {stats['failed']}，跳过 {stats['skipped']}，"
                 f"删除 {stats['deleted']}"
             )
+            if self.stats_writer:
+                self.log(
+                    f"统计已写入 {os.path.join(self.output_dir, STATS_FILENAME)}"
+                )
         except Exception as exc:
             self.log(f"运行异常: {exc}")
             self.log(traceback.format_exc())
         finally:
+            self.flush_all_accounts()
             self.ui_queue.put(("done", stats))
 
     # -- accounts -------------------------------------------------------
-    def setup_account(self) -> None:
-        acct = Account(self.config["cookie_entry"])
-        self.account = acct
+    def open_stats_writer(self) -> None:
+        path = os.path.join(self.output_dir, STATS_FILENAME)
+        try:
+            self.stats_writer = ExcelStatsWriter(path, self.accounts)
+            self.log(
+                f"统计文件: {path}（每个 CK 每 "
+                f"{STATS_FLUSH_INTERVAL} 张更新一次）"
+            )
+        except Exception as exc:
+            self.stats_writer = None
+            self.log(f"创建 Excel 统计文件失败: {exc}")
+
+    def setup_account(self, acct: Account) -> None:
         try:
             acct.catalog_id = lr.discover_catalog(acct.client)
             acct.account_id = lr.discover_account_id(acct.client, acct.catalog_id)
@@ -1194,7 +1328,37 @@ class Worker(threading.Thread):
                 )
         except Exception as exc:
             acct.healthy = False
-            self.log(f"{acct.label} 不可用（cookie 无效或网络错误）: {exc}")
+            self.log(f"{acct.describe()} 不可用（cookie 无效或网络错误）: {exc}")
+
+    def record_outcome(self, acct: Account, outcome: str) -> None:
+        st = acct.stats
+        if outcome == "success":
+            st["success"] += 1
+        elif outcome in ("failed", "duplicate"):
+            st["failed"] += 1
+        else:
+            return
+        st["total"] += 1
+        if st["total"] % STATS_FLUSH_INTERVAL == 0:
+            self.flush_account(acct)
+
+    def flush_account(self, acct: Account) -> None:
+        if not self.stats_writer:
+            return
+        st = acct.stats
+        if st["total"] == acct.flushed_total:
+            return
+        try:
+            self.stats_writer.update(
+                acct, st["success"], st["failed"], st["total"]
+            )
+            acct.flushed_total = st["total"]
+        except Exception as exc:
+            self.log(f"写入 Excel 统计失败: {exc}")
+
+    def flush_all_accounts(self) -> None:
+        for acct in self.accounts:
+            self.flush_account(acct)
 
     def refresh_storage(self, acct: Account, max_age: float = 30.0):
         if not acct.account_id:
@@ -1210,13 +1374,14 @@ class Worker(threading.Thread):
 
     # -- per image ------------------------------------------------------
     def process_image(
-        self, index: int, image_path: str, relpath: str, filename: str, size: int
+        self,
+        acct: Account,
+        index: int,
+        image_path: str,
+        relpath: str,
+        filename: str,
+        size: int,
     ) -> tuple[str, bool]:
-        acct = self.account
-        if not acct or not acct.healthy:
-            self.log(f"跳过 {relpath}: 账号不可用")
-            return "skipped", False
-
         # Mirror the web app: only same content hash AND same filename counts
         # as a duplicate.  A renamed copy of an uploaded photo is allowed.
         try:
@@ -1241,9 +1406,9 @@ class Worker(threading.Thread):
             try:
                 lr.ensure_space_for(storage, size)
             except lr.QuotaExceededError as exc:
-                self.quota_stop = True
-                self.log(f"{acct.label} 配额不足，停止全部流程: {exc}")
-                return "quota_stop", False
+                acct.exhausted = True
+                self.log(f"{acct.label} 配额不足: {exc}")
+                return "switch", False
 
         self.log(f"处理 {relpath} -> {acct.label}，标题: {title}")
         try:
@@ -1276,7 +1441,10 @@ class Worker(threading.Thread):
                 self.log(f"写入 results.csv 失败: {exc}")
             self.log(f"成功 {relpath} | {final_title} | {info['share_url']}")
             deleted = False
-            if self.config["delete_images"]:
+            # With several CKs the source file is needed by every CK, so only
+            # delete after the last CK has successfully processed the image.
+            is_last_ck = acct.index == len(self.accounts) - 1
+            if self.config["delete_images"] and is_last_ck:
                 try:
                     os.remove(image_path)
                     deleted = True
@@ -1287,7 +1455,11 @@ class Worker(threading.Thread):
         if status == "duplicate":
             return "duplicate", False
         if status == "quota_stop":
-            return "quota_stop", False
+            acct.exhausted = True
+            return "switch", False
+        if status == "retry_account":
+            acct.healthy = False
+            return "switch", False
         return "failed", False
 
     # -- pipeline -------------------------------------------------------
@@ -1322,10 +1494,8 @@ class Worker(threading.Thread):
                     try:
                         lr.ensure_space_for(storage, os.path.getsize(image_path))
                     except lr.QuotaExceededError as quota_exc:
-                        self.quota_stop = True
-                        self.log(
-                            f"{acct.label} 配额不足，停止全部流程: {quota_exc}"
-                        )
+                        acct.exhausted = True
+                        self.log(f"{acct.label} 配额不足: {quota_exc}")
                         return "quota_stop", None
                 acct.healthy = False
                 self.log(f"{acct.label} 可能 cookie 失效或无权限，跳过该账号")
@@ -1356,16 +1526,6 @@ class Worker(threading.Thread):
                     self.log(f"{filename} 已上传，但没有创建共享链接")
                     return "failed", None
                 time.sleep(2)
-
-        # Save every generated share link as soon as it exists, even if the
-        # title update below fails.
-        try:
-            append_share_link(self.output_dir, share["share_url"])
-            self.log(
-                f"共享链接已写入 {SHARE_LINKS_FILENAME}: {share['share_url']}"
-            )
-        except OSError as exc:
-            self.log(f"写入 {SHARE_LINKS_FILENAME} 失败: {exc}")
 
         # Title update. The Lightroom API does not currently reject duplicate
         # titles, but if it (or a transient error) fails, generate a new title
@@ -1567,6 +1727,7 @@ class App(tk.Tk):
         self.image_dir_var = tk.StringVar()
         self.title_dir_var = tk.StringVar()
         self.output_dir_var = tk.StringVar()
+        self.cookie_file_var = tk.StringVar()
         self.delete_var = tk.BooleanVar(value=False)
         self.progress_var = tk.StringVar(value="就绪")
 
@@ -1704,7 +1865,7 @@ class App(tk.Tk):
             bg=BG, fg=MUTED, font=UI_FONT,
         ).pack(side="left")
         tk.Label(
-            sub, text="单账号", bg="#E0E7FF", fg="#3730A3",
+            sub, text="多 CK 依次使用", bg="#E0E7FF", fg="#3730A3",
             font=SMALL_FONT, padx=8, pady=2,
         ).pack(side="left", padx=(10, 0))
 
@@ -1805,35 +1966,37 @@ class App(tk.Tk):
             row=1, column=1, sticky="nsew", padx=(6, 0), pady=(0, 12)
         )
         cookie_head = self._section(
-            cookie_card, "3", "Cookie", "只使用一个账号"
+            cookie_card, "3", "Cookie 文件", "每行一个 CK，依次使用"
         )
         ttk.Button(
-            cookie_head, text="清空", style="Secondary.TButton",
-            command=self.clear_cookie,
+            cookie_head, text="浏览", style="Secondary.TButton",
+            command=self.choose_cookie_file,
         ).pack(side="right")
-        ttk.Button(
-            cookie_head, text="粘贴", style="Secondary.TButton",
-            command=self.paste_cookie,
-        ).pack(side="right", padx=(0, 8))
         cookie_body = tk.Frame(cookie_card, bg=CARD)
         cookie_body.pack(fill="x", padx=16, pady=(0, 8))
-        self.cookies_text = tk.Text(
-            cookie_body, height=5, wrap="word", undo=True, bg=CARD,
-            fg=TEXT, insertbackground=ACCENT, relief="flat",
-            highlightthickness=1, highlightbackground=BORDER,
-            highlightcolor=ACCENT, font=MONO_FONT, padx=8, pady=6,
+        cookie_body.columnconfigure(0, weight=1)
+        self.cookie_file_entry = ttk.Entry(
+            cookie_body, textvariable=self.cookie_file_var, style="Card.TEntry"
         )
-        cookie_scroll = ttk.Scrollbar(
-            cookie_body, orient="vertical", command=self.cookies_text.yview,
-            style="Vertical.TScrollbar",
+        self.cookie_file_entry.grid(row=0, column=0, sticky="ew")
+        self.cookie_file_entry.bind(
+            "<Return>",
+            lambda _event: self._refresh_cookie_file_info(log_changes=True),
         )
-        self.cookies_text.configure(yscrollcommand=cookie_scroll.set)
-        cookie_scroll.pack(side="right", fill="y")
-        self.cookies_text.pack(side="left", fill="both", expand=True)
+        self.cookie_file_entry.bind(
+            "<FocusOut>", lambda _event: self._refresh_cookie_file_info()
+        )
+        self.cookie_count_var = tk.StringVar(value="未选择 Cookie 文件")
+        tk.Label(
+            cookie_body, textvariable=self.cookie_count_var,
+            bg=CARD, fg=MUTED, font=SMALL_FONT, anchor="w",
+        ).grid(row=1, column=0, sticky="w", pady=(6, 0))
         tk.Label(
             cookie_card,
-            text=f"Cookie 保存在本机配置文件：{STATE_PATH}",
+            text="按行读取，每行一个完整 Cookie；每个 CK 都会把所有图片"
+                 "完整处理一遍，再切换到下一个 CK",
             bg=CARD, fg=MUTED, font=SMALL_FONT,
+            wraplength=300, justify="left",
         ).pack(anchor="w", padx=16, pady=(0, 12))
 
         options_card = self._card(content)
@@ -1903,20 +2066,38 @@ class App(tk.Tk):
         self.log_text.tag_configure("error", foreground="#F87171")
         self.log_text.tag_configure("muted", foreground="#94A3B8")
 
-    def paste_cookie(self) -> None:
-        try:
-            text = self.clipboard_get()
-        except tk.TclError:
+    def choose_cookie_file(self) -> None:
+        path = filedialog.askopenfilename(
+            initialdir=(
+                os.path.dirname(self.cookie_file_var.get())
+                if self.cookie_file_var.get()
+                else os.path.expanduser("~")
+            ),
+            title="选择 Cookie 文件（每行一个）",
+            filetypes=[("文本文件", "*.txt"), ("所有文件", "*.*")],
+        )
+        if not path:
             return
-        self.cookies_text.delete("1.0", "end")
-        self.cookies_text.insert("1.0", text.strip())
+        self.cookie_file_var.set(path)
+        self._refresh_cookie_file_info(log_changes=True)
         self.save_state()
-        self.log("已从剪贴板粘贴 Cookie")
 
-    def clear_cookie(self) -> None:
-        self.cookies_text.delete("1.0", "end")
-        self.save_state()
-        self.log("已清空 Cookie")
+    def _refresh_cookie_file_info(self, log_changes: bool = False) -> None:
+        path = self.cookie_file_var.get().strip()
+        if not path:
+            self.cookie_count_var.set("未选择 Cookie 文件")
+            return
+        if not os.path.isfile(path):
+            self.cookie_count_var.set("文件不存在")
+            return
+        try:
+            entries = read_cookie_entries_from_file(path)
+        except OSError as exc:
+            self.cookie_count_var.set(f"读取失败: {exc}")
+            return
+        self.cookie_count_var.set(f"文件内共 {len(entries)} 个 CK")
+        if log_changes:
+            self.log(f"Cookie 文件: {path}（{len(entries)} 个 CK）")
 
     def clear_log(self) -> None:
         self.log_text.configure(state="normal")
@@ -1928,10 +2109,9 @@ class App(tk.Tk):
         self.image_dir_var.set(sd.get("image_dir", "") or "")
         self.title_dir_var.set(sd.get("title_dir", "") or "")
         self.output_dir_var.set(sd.get("output_dir") or DEFAULT_OUTPUT_DIR)
+        self.cookie_file_var.set(sd.get("cookie_file") or "")
         self.delete_var.set(bool(sd.get("delete_images", False)))
-        cookies = sd.get("cookies") or ""
-        if cookies:
-            self.cookies_text.insert("1.0", cookies)
+        self._refresh_cookie_file_info()
 
         if self.image_dir_var.get() and os.path.isdir(self.image_dir_var.get()):
             try:
@@ -2127,7 +2307,7 @@ class App(tk.Tk):
 
     # -- state ----------------------------------------------------------
     def save_state(self) -> None:
-        if not hasattr(self, "cookies_text"):
+        if not hasattr(self, "cookie_file_entry"):
             return
         data = {
             "image_dir": self.image_dir_var.get().strip(),
@@ -2135,7 +2315,7 @@ class App(tk.Tk):
             "selected_titles": list(self.title_order),
             "delete_images": bool(self.delete_var.get()),
             "output_dir": self.output_dir_var.get().strip(),
-            "cookies": self.cookies_text.get("1.0", "end").rstrip("\n"),
+            "cookie_file": self.cookie_file_var.get().strip(),
             "window_geometry": self.geometry(),
         }
         try:
@@ -2180,21 +2360,27 @@ class App(tk.Tk):
                 )
                 return
 
-        cookie_entries = [
-            entry
-            for entry in parse_cookie_entries(
-                self.cookies_text.get("1.0", "end").strip()
-            )
-            if "=" in entry["header"]
-        ]
-        if not cookie_entries:
-            messagebox.showerror("错误", "请填写有效的 Cookie")
+        cookie_file = self.cookie_file_var.get().strip()
+        if not cookie_file or not os.path.isfile(cookie_file):
+            messagebox.showerror("错误", "请选择有效的 Cookie 文件（.txt）")
             return
-        cookie_entry = cookie_entries[0]
-        if len(cookie_entries) > 1:
-            self.log(
-                f"检测到 {len(cookie_entries)} 个 Cookie，只使用第一个账号"
+        try:
+            cookie_entries = read_cookie_entries_from_file(cookie_file)
+        except OSError as exc:
+            messagebox.showerror("错误", f"读取 Cookie 文件失败:\n{exc}")
+            return
+        if not cookie_entries:
+            messagebox.showerror(
+                "错误", "Cookie 文件中没有有效的 Cookie（每行一个）"
             )
+            return
+        if Workbook is None:
+            messagebox.showerror(
+                "错误",
+                "缺少 openpyxl，无法输出 Excel 统计。\n"
+                "请先执行: pip install openpyxl",
+            )
+            return
 
         images = scan_images(image_dir)
         if not images:
@@ -2219,15 +2405,16 @@ class App(tk.Tk):
         self.progress_var.set(f"准备处理 {len(images)} 张图片...")
         self.log("=" * 70)
         self.log(
-            f"开始：{len(images)} 张图片，1 个账号，"
+            f"开始：{len(images)} 张图片，{len(cookie_entries)} 个 CK，"
             f"{len(title_paths)} 个标题文件"
         )
+        self.log(f"Cookie 文件: {cookie_file}")
 
         config = {
             "image_dir": image_dir,
             "title_files": title_paths,
             "output_dir": output_dir,
-            "cookie_entry": cookie_entry,
+            "cookie_entries": cookie_entries,
             "delete_images": bool(self.delete_var.get()),
         }
         self.worker = Worker(config, self.ui_queue, self.stop_event)
@@ -2264,13 +2451,26 @@ class App(tk.Tk):
     def _on_worker_done(self, stats: dict) -> None:
         self.start_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
-        self.progress_bar.configure(value=100)
+        total = stats.get("total", 0)
+        processed = (
+            stats.get("success", 0)
+            + stats.get("failed", 0)
+            + stats.get("duplicate", 0)
+            + stats.get("skipped", 0)
+        )
+        if total and processed < total:
+            self.progress_bar.configure(value=processed / total * 100)
+        else:
+            self.progress_bar.configure(value=100)
         summary = (
             f"完成：成功 {stats.get('success', 0)}，"
             f"重复跳过 {stats.get('duplicate', 0)}，"
             f"失败 {stats.get('failed', 0)}，跳过 {stats.get('skipped', 0)}，"
             f"删除 {stats.get('deleted', 0)}"
         )
+        unprocessed = total - processed
+        if unprocessed > 0:
+            summary += f"，未处理 {unprocessed}"
         self.progress_var.set(summary)
         self.log(summary)
         self.worker = None
