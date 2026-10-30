@@ -4,3 +4,4 @@
 #
 # 打包 exe 的构建依赖：
 pyinstaller>=6.0
+openpyxl
