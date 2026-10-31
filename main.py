@@ -676,7 +676,6 @@ lr = types.SimpleNamespace(
 
 
 import base64
-import contextlib
 import csv
 import hashlib
 import io
@@ -716,6 +715,7 @@ IMAGE_EXTS = {
 RESULTS_FILENAME = "results.csv"
 LOG_FILENAME = "run.log"
 STATS_FILENAME = "结果统计.xlsx"
+SHARE_LINKS_FILENAME = "结果链接.txt"
 RESULT_HEADERS = [
     "时间", "账号", "账号标识", "图片文件", "标题",
     "asset_id", "album_id", "space_id", "共享链接",
@@ -1009,17 +1009,38 @@ def load_state() -> dict:
         return {}
 
 
+_RESULTS_CSV_LOCK = threading.Lock()
+_SHARE_LINKS_LOCK = threading.Lock()
+
+
 def append_result_csv(output_dir: str, row: list) -> None:
+    """Append one result row.  The lock also covers the header decision so
+    concurrent CK threads can never write two headers."""
     os.makedirs(output_dir, exist_ok=True)
     path = os.path.join(output_dir, RESULTS_FILENAME)
-    new_file = not os.path.exists(path)
-    with open(
-        path, "a", encoding="utf-8-sig" if new_file else "utf-8", newline=""
-    ) as fh:
-        writer = csv.writer(fh)
-        if new_file:
-            writer.writerow(RESULT_HEADERS)
-        writer.writerow(row)
+    with _RESULTS_CSV_LOCK:
+        new_file = not os.path.exists(path)
+        with open(
+            path, "a", encoding="utf-8-sig" if new_file else "utf-8", newline=""
+        ) as fh:
+            writer = csv.writer(fh)
+            if new_file:
+                writer.writerow(RESULT_HEADERS)
+            writer.writerow(row)
+
+
+def append_share_link(output_dir: str, url: str) -> None:
+    """Append one share link per line to 结果链接.txt.
+
+    Called as soon as the share exists, even if the later title update fails,
+    so a usable link is never lost.  The lock keeps concurrent CK threads from
+    interleaving lines.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    path = os.path.join(output_dir, SHARE_LINKS_FILENAME)
+    with _SHARE_LINKS_LOCK:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(str(url).rstrip() + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -1059,6 +1080,7 @@ class ExcelStatsWriter:
             raise RuntimeError(
                 "缺少 openpyxl，无法写入 Excel。请先执行: pip install openpyxl"
             )
+        self._lock = threading.RLock()
         self.path = path
         self.workbook = Workbook()
         sheet = self.workbook.active
@@ -1079,29 +1101,32 @@ class ExcelStatsWriter:
         self.save()
 
     def add_account(self, account: "Account") -> None:
-        row = self.sheet.max_row + 1
-        self.sheet.cell(row=row, column=1, value=excel_safe(account.header))
-        for column in (2, 3, 4):
-            self.sheet.cell(row=row, column=column, value=0)
-        self.rows[account.index] = row
+        with self._lock:
+            row = self.sheet.max_row + 1
+            self.sheet.cell(row=row, column=1, value=excel_safe(account.header))
+            for column in (2, 3, 4):
+                self.sheet.cell(row=row, column=column, value=0)
+            self.rows[account.index] = row
 
     def update(
         self, account: "Account", success: int, failed: int, total: int
     ) -> None:
-        row = self.rows.get(account.index)
-        if row is None:
-            self.add_account(account)
-            row = self.rows[account.index]
-        self.sheet.cell(row=row, column=2, value=success)
-        self.sheet.cell(row=row, column=3, value=failed)
-        self.sheet.cell(row=row, column=4, value=total)
-        self.save()
+        with self._lock:
+            row = self.rows.get(account.index)
+            if row is None:
+                self.add_account(account)
+                row = self.rows[account.index]
+            self.sheet.cell(row=row, column=2, value=success)
+            self.sheet.cell(row=row, column=3, value=failed)
+            self.sheet.cell(row=row, column=4, value=total)
+            self.save()
 
     def save(self) -> None:
-        directory = os.path.dirname(self.path)
-        if directory:
-            os.makedirs(directory, exist_ok=True)
-        self.workbook.save(self.path)
+        with self._lock:
+            directory = os.path.dirname(self.path)
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            self.workbook.save(self.path)
 
 
 # ---------------------------------------------------------------------------
@@ -1128,6 +1153,51 @@ class LogStream(io.TextIOBase):
         if self._buffer.strip():
             self.log_fn(self._buffer.strip())
             self._buffer = ""
+
+
+class ThreadStreamRouter(io.TextIOBase):
+    """Route print() output to a per-thread stream.
+
+    ``contextlib.redirect_stdout`` swaps process-global sys.stdout, which is
+    unsafe once several CK threads run at the same time.  This router is
+    installed once; each worker thread binds its own LogStream and all other
+    writes fall back to the original stream.
+    """
+
+    def __init__(self, fallback):
+        self._fallback = fallback
+        self._local = threading.local()
+
+    def bind(self, stream) -> None:
+        self._local.stream = stream
+
+    def unbind(self) -> None:
+        self._local.stream = None
+
+    def _target(self):
+        return getattr(self._local, "stream", None) or self._fallback
+
+    def write(self, text):
+        target = self._target()
+        if target is None:
+            return len(text)
+        return target.write(text)
+
+    def flush(self):
+        target = self._target()
+        flush = getattr(target, "flush", None)
+        if flush:
+            flush()
+
+    def writable(self) -> bool:
+        return True
+
+    def isatty(self) -> bool:
+        return False
+
+    @property
+    def encoding(self):
+        return getattr(self._fallback, "encoding", "utf-8") or "utf-8"
 
 
 class Account:
@@ -1157,37 +1227,70 @@ class Worker(threading.Thread):
         self.ui_queue = ui_queue
         self.stop_event = stop_event
         self.output_dir = config["output_dir"]
+        self.concurrency = max(1, int(config.get("concurrency") or 1))
+        self.effective_concurrency = 1
+        self.immediate_delete = True
         self.pool: TitlePool | None = None
         self.accounts: list[Account] = []
+        self.images: list[str] = []
+        self.total_tasks = 0
         self.stats_writer: ExcelStatsWriter | None = None
-
-    # -- logging --------------------------------------------------------
-    def log(self, message: str) -> None:
-        text = f"[{datetime.now().strftime('%H:%M:%S')}] {message}"
-        self.ui_queue.put(("log", text))
-        try:
-            os.makedirs(self.output_dir, exist_ok=True)
-            with open(
-                os.path.join(self.output_dir, LOG_FILENAME), "a", encoding="utf-8"
-            ) as fh:
-                fh.write(text + "\n")
-        except Exception:
-            pass
-
-    # -- main -----------------------------------------------------------
-    def run(self) -> None:
-        stats = {
+        self.stats = {
             "success": 0, "failed": 0, "skipped": 0,
             "duplicate": 0, "deleted": 0, "total": 0,
         }
+        self.done_tasks = 0
+        self._progress_lock = threading.Lock()
+        self._log_lock = threading.Lock()
+        self._tls = threading.local()
+        self._active_labels: set[str] = set()
+        self._stdout_router = ThreadStreamRouter(sys.stdout)
+        self._stderr_router = ThreadStreamRouter(sys.stderr)
+        self._orig_stdout = sys.stdout
+        self._orig_stderr = sys.stderr
+
+    # -- logging --------------------------------------------------------
+    def log(self, message: str) -> None:
+        label = getattr(self._tls, "label", "")
+        prefix = f"[{label}] " if label else ""
+        text = f"[{datetime.now().strftime('%H:%M:%S')}] {prefix}{message}"
+        self.ui_queue.put(("log", text))
+        try:
+            os.makedirs(self.output_dir, exist_ok=True)
+            with self._log_lock:
+                with open(
+                    os.path.join(self.output_dir, LOG_FILENAME),
+                    "a", encoding="utf-8",
+                ) as fh:
+                    fh.write(text + "\n")
+        except Exception:
+            pass
+
+    # -- stream routing -------------------------------------------------
+    def _install_streams(self) -> None:
+        self._orig_stdout = sys.stdout
+        self._orig_stderr = sys.stderr
+        self._stdout_router = ThreadStreamRouter(self._orig_stdout)
+        self._stderr_router = ThreadStreamRouter(self._orig_stderr)
+        sys.stdout = self._stdout_router
+        sys.stderr = self._stderr_router
+
+    def _restore_streams(self) -> None:
+        sys.stdout = self._orig_stdout
+        sys.stderr = self._orig_stderr
+
+    # -- main -----------------------------------------------------------
+    def run(self) -> None:
+        stats = self.stats
         try:
             images = scan_images(self.config["image_dir"])
+            self.images = images
             entries = self.config["cookie_entries"]
             self.accounts = [
                 Account(index, entry) for index, entry in enumerate(entries)
             ]
-            total_tasks = len(images) * len(self.accounts)
-            stats["total"] = total_tasks
+            self.total_tasks = len(images) * len(self.accounts)
+            stats["total"] = self.total_tasks
             self.log(
                 f"图片 {len(images)} 张，标题文件 "
                 f"{len(self.config['title_files'])} 个，CK {len(self.accounts)} 个"
@@ -1202,78 +1305,89 @@ class Worker(threading.Thread):
                 return
             self.log(
                 f"标题组合总数: {self.pool.total}（图片 {len(images)} 张 × "
-                f"CK {len(self.accounts)} 个 = 约 {total_tasks} 个标题）"
+                f"CK {len(self.accounts)} 个 = 约 {self.total_tasks} 个标题）"
             )
-            if self.pool.total < total_tasks:
+            if self.pool.total < self.total_tasks:
                 self.log(
                     f"提示：标题组合数 {self.pool.total} 少于本轮标题生成"
-                    f"次数 {total_tasks}，部分标题会重复使用（不影响上传）"
+                    f"次数 {self.total_tasks}，部分标题会重复使用（不影响上传）"
                 )
             if self.config["delete_images"] and len(self.accounts) > 1:
-                self.log(
-                    "提示：已勾选删除源图片，只会在最后一个 CK 成功处理"
-                    "每张图片后删除，前面的 CK 不会删除"
-                )
+                if min(self.concurrency, len(self.accounts)) > 1:
+                    self.log(
+                        "提示：已勾选删除源图片；并发运行时不会边跑边删，"
+                        "会在所有 CK 全部结束后统一删除最后一个 CK 成功的图片"
+                    )
+                else:
+                    self.log(
+                        "提示：已勾选删除源图片，只会在最后一个 CK 成功处理"
+                        "每张图片后删除，前面的 CK 不会删除"
+                    )
 
             self.open_stats_writer()
 
-            done_tasks = 0
-            for acct in self.accounts:
-                if self.stop_event.is_set():
-                    self.log("收到停止信号，结束")
-                    break
-                self.setup_account(acct)
-                if not acct.healthy:
-                    self.flush_account(acct)
-                    self.log(f"{acct.label} 不可用，跳过该 CK")
-                    continue
-                self.log(f"开始使用 {acct.describe()}")
+            effective = max(1, min(self.concurrency, len(self.accounts)))
+            self.effective_concurrency = effective
+            self.immediate_delete = effective <= 1
+            if effective < self.concurrency:
+                self.log(
+                    f"并发数 {self.concurrency} 超过 CK 数，"
+                    f"实际并发 {effective}"
+                )
+            elif effective > 1:
+                self.log(f"并发模式：同时运行 {effective} 个 CK")
+            if effective > 10:
+                self.log(
+                    "提示：并发数较高，可能触发服务端限流，"
+                    "上传大图时内存占用也会升高"
+                )
 
-                for image_index, image_path in enumerate(images):
+            success_by_index: dict[int, list[str]] = {}
+            self._install_streams()
+            try:
+                if effective <= 1:
+                    for acct in self.accounts:
+                        if self.stop_event.is_set():
+                            self.log("收到停止信号，结束")
+                            break
+                        success_by_index[acct.index] = self.process_account(acct)
+                else:
+                    account_queue: queue.Queue = queue.Queue()
+                    for acct in self.accounts:
+                        account_queue.put(acct)
+
+                    def account_worker() -> None:
+                        while not self.stop_event.is_set():
+                            try:
+                                acct = account_queue.get_nowait()
+                            except queue.Empty:
+                                return
+                            try:
+                                successes = self.process_account(acct)
+                            except Exception as exc:
+                                self.log(f"{acct.label} 线程异常: {exc}")
+                                self.log(traceback.format_exc())
+                                successes = []
+                            with self._progress_lock:
+                                success_by_index[acct.index] = successes
+
+                    threads = [
+                        threading.Thread(target=account_worker, daemon=True)
+                        for _ in range(effective)
+                    ]
+                    for thread in threads:
+                        thread.start()
+                    for thread in threads:
+                        thread.join()
                     if self.stop_event.is_set():
                         self.log("收到停止信号，结束")
-                        break
-                    if acct.exhausted or not acct.healthy:
-                        break
-                    filename = os.path.basename(image_path)
-                    relpath = os.path.relpath(
-                        image_path, self.config["image_dir"]
-                    )
-                    try:
-                        size = os.path.getsize(image_path)
-                    except OSError as exc:
-                        self.log(f"读取文件失败 {relpath}: {exc}")
-                        stats["failed"] += 1
-                        done_tasks += 1
-                        continue
-                    outcome, deleted = self.process_image(
-                        acct, image_index, image_path, relpath, filename, size
-                    )
-                    if outcome == "switch":
-                        break
-                    self.record_outcome(acct, outcome)
-                    stats[outcome] += 1
-                    done_tasks += 1
-                    if deleted:
-                        stats["deleted"] += 1
-                    progress = (
-                        f"进度 {done_tasks}/{total_tasks} | "
-                        f"CK {acct.index + 1}/{len(self.accounts)} | "
-                        f"图片 {image_index + 1}/{len(images)} | "
-                        f"成功 {stats['success']} | 重复 {stats['duplicate']} | "
-                        f"失败 {stats['failed']}"
-                    )
-                    self.ui_queue.put(("progress", progress))
-                    time.sleep(0.4)
+            finally:
+                self._restore_streams()
 
-                self.flush_account(acct)
-                st = acct.stats
-                self.log(
-                    f"{acct.label} 结束：成功 {st['success']}，"
-                    f"失败 {st['failed']}，总数 {st['total']}"
-                )
-                if self.stop_event.is_set():
-                    break
+            deleted = self.finalize_deletions(success_by_index)
+            if deleted:
+                with self._progress_lock:
+                    stats["deleted"] += deleted
 
             self.log(
                 f"结束：成功 {stats['success']}，重复跳过 {stats['duplicate']}，"
@@ -1284,12 +1398,119 @@ class Worker(threading.Thread):
                 self.log(
                     f"统计已写入 {os.path.join(self.output_dir, STATS_FILENAME)}"
                 )
+                self.log(
+                    f"共享链接已写入 {os.path.join(self.output_dir, SHARE_LINKS_FILENAME)}"
+                )
         except Exception as exc:
             self.log(f"运行异常: {exc}")
             self.log(traceback.format_exc())
         finally:
             self.flush_all_accounts()
             self.ui_queue.put(("done", stats))
+
+    def process_account(self, acct: Account) -> list[str]:
+        """Process every image with one CK; safe to run in its own thread."""
+        successes: list[str] = []
+        if self.stop_event.is_set():
+            return successes
+        self._tls.label = acct.label
+        self._set_active(acct.label, True)
+        try:
+            self.setup_account(acct)
+            if not acct.healthy:
+                self.log(f"{acct.label} 不可用，跳过该 CK")
+                return successes
+            self.log(f"开始使用 {acct.describe()}")
+
+            for image_index, image_path in enumerate(self.images):
+                if self.stop_event.is_set():
+                    self.log("收到停止信号，结束")
+                    break
+                if acct.exhausted or not acct.healthy:
+                    break
+                filename = os.path.basename(image_path)
+                relpath = os.path.relpath(image_path, self.config["image_dir"])
+                try:
+                    size = os.path.getsize(image_path)
+                except OSError as exc:
+                    self.log(f"读取文件失败 {relpath}: {exc}")
+                    self.record_outcome(acct, "failed")
+                    self._emit_progress(acct, image_index)
+                    continue
+                outcome, deleted = self.process_image(
+                    acct, image_index, image_path, relpath, filename, size
+                )
+                if outcome == "switch":
+                    break
+                self.record_outcome(acct, outcome)
+                if outcome == "success":
+                    successes.append(relpath)
+                if deleted:
+                    with self._progress_lock:
+                        self.stats["deleted"] += 1
+                self._emit_progress(acct, image_index)
+                time.sleep(0.4)
+        except Exception as exc:
+            self.log(f"{acct.label} 处理异常: {exc}")
+            self.log(traceback.format_exc())
+            acct.healthy = False
+        finally:
+            self._set_active(acct.label, False)
+            self.flush_account(acct)
+            st = acct.stats
+            self.log(
+                f"{acct.label} 结束：成功 {st['success']}，"
+                f"失败 {st['failed']}，总数 {st['total']}"
+            )
+            self._tls.label = ""
+        return successes
+
+    def finalize_deletions(self, success_by_index: dict[int, list[str]]) -> int:
+        """Delete sources only after every CK thread has finished.
+
+        Matches the sequential rule: a photo is deleted only when the last CK
+        in the cookie file processed it successfully.  With concurrent CKs the
+        file must stay on disk until all of them are done.
+        """
+        if not self.config.get("delete_images") or self.immediate_delete:
+            return 0
+        if not self.accounts:
+            return 0
+        last_index = len(self.accounts) - 1
+        deleted = 0
+        for relpath in success_by_index.get(last_index) or []:
+            image_path = os.path.join(self.config["image_dir"], relpath)
+            try:
+                os.remove(image_path)
+                deleted += 1
+                self.log(f"已删除源图片: {relpath}")
+            except OSError as exc:
+                self.log(f"删除源图片失败 {relpath}: {exc}")
+        return deleted
+
+    def _set_active(self, label: str, active: bool) -> None:
+        with self._progress_lock:
+            if active:
+                self._active_labels.add(label)
+            else:
+                self._active_labels.discard(label)
+
+    def _emit_progress(self, acct: Account, image_index: int) -> None:
+        with self._progress_lock:
+            done = self.done_tasks
+            active = ",".join(
+                sorted(self._active_labels, key=natural_key)
+            ) or "-"
+            success = self.stats["success"]
+            duplicate = self.stats["duplicate"]
+            failed = self.stats["failed"]
+        progress = (
+            f"进度 {done}/{self.total_tasks} | "
+            f"并发 {self.effective_concurrency} | 运行中 {active} | "
+            f"{acct.label} 图片 {image_index + 1}/{len(self.images)} | "
+            f"成功 {success} | 重复 {duplicate} | 失败 {failed}"
+        )
+        self.ui_queue.put(("progress", progress))
 
     # -- accounts -------------------------------------------------------
     def open_stats_writer(self) -> None:
@@ -1341,6 +1562,9 @@ class Worker(threading.Thread):
         st["total"] += 1
         if st["total"] % STATS_FLUSH_INTERVAL == 0:
             self.flush_account(acct)
+        with self._progress_lock:
+            self.stats[outcome] = self.stats.get(outcome, 0) + 1
+            self.done_tasks += 1
 
     def flush_account(self, acct: Account) -> None:
         if not self.stats_writer:
@@ -1443,8 +1667,14 @@ class Worker(threading.Thread):
             deleted = False
             # With several CKs the source file is needed by every CK, so only
             # delete after the last CK has successfully processed the image.
+            # In concurrent mode no thread deletes here; the Worker deletes
+            # after every CK thread has finished (see finalize_deletions).
             is_last_ck = acct.index == len(self.accounts) - 1
-            if self.config["delete_images"] and is_last_ck:
+            if (
+                self.config["delete_images"]
+                and is_last_ck
+                and self.immediate_delete
+            ):
                 try:
                     os.remove(image_path)
                     deleted = True
@@ -1467,8 +1697,15 @@ class Worker(threading.Thread):
         self, acct: Account, image_path: str, filename: str, title: str
     ) -> tuple[str, dict | None]:
         stream = LogStream(self.log)
-        with contextlib.redirect_stdout(stream), contextlib.redirect_stderr(stream):
+        # Bind the stream to this thread only; a process-wide
+        # contextlib.redirect_stdout would mix output between CK threads.
+        self._stdout_router.bind(stream)
+        self._stderr_router.bind(stream)
+        try:
             return self._run_pipeline(acct, image_path, filename, title)
+        finally:
+            self._stdout_router.unbind()
+            self._stderr_router.unbind()
 
     def _run_pipeline(
         self, acct: Account, image_path: str, filename: str, title: str
@@ -1526,6 +1763,17 @@ class Worker(threading.Thread):
                     self.log(f"{filename} 已上传，但没有创建共享链接")
                     return "failed", None
                 time.sleep(2)
+
+        # The share is live now; save its link immediately so a later title
+        # failure cannot lose it.  append_share_link has its own lock, so
+        # concurrent CK threads cannot interleave lines.
+        try:
+            append_share_link(self.output_dir, share["share_url"])
+            self.log(
+                f"共享链接已写入 {SHARE_LINKS_FILENAME}: {share['share_url']}"
+            )
+        except OSError as exc:
+            self.log(f"写入 {SHARE_LINKS_FILENAME} 失败: {exc}")
 
         # Title update. The Lightroom API does not currently reject duplicate
         # titles, but if it (or a transient error) fails, generate a new title
@@ -1728,6 +1976,8 @@ class App(tk.Tk):
         self.title_dir_var = tk.StringVar()
         self.output_dir_var = tk.StringVar()
         self.cookie_file_var = tk.StringVar()
+        self.concurrency_var = tk.StringVar(value="1")
+        self.concurrency_entry: ttk.Entry | None = None
         self.delete_var = tk.BooleanVar(value=False)
         self.progress_var = tk.StringVar(value="就绪")
 
@@ -1865,7 +2115,7 @@ class App(tk.Tk):
             bg=BG, fg=MUTED, font=UI_FONT,
         ).pack(side="left")
         tk.Label(
-            sub, text="多 CK 依次使用", bg="#E0E7FF", fg="#3730A3",
+            sub, text="多 CK 可并发", bg="#E0E7FF", fg="#3730A3",
             font=SMALL_FONT, padx=8, pady=2,
         ).pack(side="left", padx=(10, 0))
 
@@ -1966,7 +2216,7 @@ class App(tk.Tk):
             row=1, column=1, sticky="nsew", padx=(6, 0), pady=(0, 12)
         )
         cookie_head = self._section(
-            cookie_card, "3", "Cookie 文件", "每行一个 CK，依次使用"
+            cookie_card, "3", "Cookie 文件", "每行一个 CK，可并发使用"
         )
         ttk.Button(
             cookie_head, text="浏览", style="Secondary.TButton",
@@ -1991,13 +2241,32 @@ class App(tk.Tk):
             cookie_body, textvariable=self.cookie_count_var,
             bg=CARD, fg=MUTED, font=SMALL_FONT, anchor="w",
         ).grid(row=1, column=0, sticky="w", pady=(6, 0))
+
+        concurrency_row = tk.Frame(cookie_body, bg=CARD)
+        concurrency_row.grid(row=2, column=0, sticky="w", pady=(10, 0))
+        tk.Label(
+            concurrency_row, text="并发数", bg=CARD, fg=TEXT, font=UI_FONT,
+        ).pack(side="left")
+        self.concurrency_entry = ttk.Entry(
+            concurrency_row, textvariable=self.concurrency_var,
+            width=6, style="Card.TEntry",
+        )
+        self.concurrency_entry.pack(side="left", padx=(8, 8))
+        self.concurrency_entry.bind("<FocusOut>", lambda _event: self.save_state())
+        self.concurrency_entry.bind("<Return>", lambda _event: self.save_state())
+        tk.Label(
+            concurrency_row,
+            text="同时运行多个 CK；1 = 依次执行，默认 1",
+            bg=CARD, fg=MUTED, font=SMALL_FONT,
+        ).pack(side="left")
         tk.Label(
             cookie_card,
             text="按行读取，每行一个完整 Cookie；每个 CK 都会把所有图片"
-                 "完整处理一遍，再切换到下一个 CK",
+                 "完整处理一遍。并发数 > 1 时同时运行多个 CK；勾选删除"
+                 "源图片时，会在本轮全部结束后统一删除",
             bg=CARD, fg=MUTED, font=SMALL_FONT,
             wraplength=300, justify="left",
-        ).pack(anchor="w", padx=16, pady=(0, 12))
+        ).pack(anchor="w", padx=16, pady=(8, 12))
 
         options_card = self._card(content)
         options_card.grid(
@@ -2110,6 +2379,12 @@ class App(tk.Tk):
         self.title_dir_var.set(sd.get("title_dir", "") or "")
         self.output_dir_var.set(sd.get("output_dir") or DEFAULT_OUTPUT_DIR)
         self.cookie_file_var.set(sd.get("cookie_file") or "")
+        raw_concurrency = str(sd.get("concurrency") or "1").strip()
+        try:
+            concurrency = int(raw_concurrency)
+        except (TypeError, ValueError):
+            concurrency = 1
+        self.concurrency_var.set(str(max(1, concurrency)))
         self.delete_var.set(bool(sd.get("delete_images", False)))
         self._refresh_cookie_file_info()
 
@@ -2316,6 +2591,7 @@ class App(tk.Tk):
             "delete_images": bool(self.delete_var.get()),
             "output_dir": self.output_dir_var.get().strip(),
             "cookie_file": self.cookie_file_var.get().strip(),
+            "concurrency": self.concurrency_var.get().strip() or "1",
             "window_geometry": self.geometry(),
         }
         try:
@@ -2333,6 +2609,14 @@ class App(tk.Tk):
             self.after(20000, self._autosave)
 
     # -- run ------------------------------------------------------------
+    def _parse_concurrency(self) -> int | None:
+        raw = self.concurrency_var.get().strip()
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return None
+        return value if value >= 1 else None
+
     def start(self) -> None:
         if self.worker and self.worker.is_alive():
             return
@@ -2374,6 +2658,13 @@ class App(tk.Tk):
                 "错误", "Cookie 文件中没有有效的 Cookie（每行一个）"
             )
             return
+        concurrency = self._parse_concurrency()
+        if concurrency is None:
+            messagebox.showerror(
+                "错误", "并发数必须是大于等于 1 的整数"
+            )
+            return
+        effective_concurrency = max(1, min(concurrency, len(cookie_entries)))
         if Workbook is None:
             messagebox.showerror(
                 "错误",
@@ -2400,21 +2691,34 @@ class App(tk.Tk):
         self.save_state()
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
+        if self.concurrency_entry is not None:
+            self.concurrency_entry.configure(state="disabled")
         self.stop_event.clear()
         self.progress_bar.configure(value=0)
-        self.progress_var.set(f"准备处理 {len(images)} 张图片...")
+        self.progress_var.set(
+            f"准备处理 {len(images)} 张图片（并发 {effective_concurrency}）..."
+        )
         self.log("=" * 70)
         self.log(
             f"开始：{len(images)} 张图片，{len(cookie_entries)} 个 CK，"
             f"{len(title_paths)} 个标题文件"
         )
         self.log(f"Cookie 文件: {cookie_file}")
+        self.log(
+            f"并发数: {concurrency}"
+            + (
+                f"（超过 CK 数，实际并发 {effective_concurrency}）"
+                if concurrency > len(cookie_entries)
+                else f"（实际并发 {effective_concurrency}）"
+            )
+        )
 
         config = {
             "image_dir": image_dir,
             "title_files": title_paths,
             "output_dir": output_dir,
             "cookie_entries": cookie_entries,
+            "concurrency": concurrency,
             "delete_images": bool(self.delete_var.get()),
         }
         self.worker = Worker(config, self.ui_queue, self.stop_event)
@@ -2451,6 +2755,8 @@ class App(tk.Tk):
     def _on_worker_done(self, stats: dict) -> None:
         self.start_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
+        if self.concurrency_entry is not None:
+            self.concurrency_entry.configure(state="normal")
         total = stats.get("total", 0)
         processed = (
             stats.get("success", 0)
